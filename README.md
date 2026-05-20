@@ -279,21 +279,141 @@ func afterModules() ([]fx.Option, error) {
 }
 ```
 
-## Complete Example
+## Pluggable Implementations (`fxmodule`)
 
-See the `examples/basic/` directory for a complete working example:
+The `fxmodule` sub-package handles the case where one interface has multiple
+swappable implementations (database connectors, message brokers, cache
+backends, etc.) that should be loadable side-by-side, addressable by scope,
+while preserving the "first-loaded becomes the unnamed default"
+backwards-compatibility semantic for single-load callers.
 
-- `main.go`: Application entry point and CLI setup
-- `modules.go`: Module loading and organization
-- `pkg/example/`: Module example using native FX
-- `pkg/basic/`: Module example using Weedbox base class
+### `InterfaceModule[I](scope, ctor)`
 
-Run the example:
+The main helper. Use it from a concrete module's `Module(scope)` factory:
+
+```go
+package sqlite_connector
+
+import (
+    "github.com/weedbox/common-modules/database"
+    "github.com/weedbox/weedbox/fxmodule"
+    "go.uber.org/fx"
+)
+
+func Module(scope string) fx.Option {
+    return fxmodule.InterfaceModule[database.DatabaseConnector](
+        scope,
+        func(p Params) database.DatabaseConnector {
+            c := &SQLiteConnector{ /* ... */ }
+            p.Lifecycle.Append(fx.Hook{OnStart: c.onStart, OnStop: c.onStop})
+            return c
+        },
+    )
+}
+```
+
+`InterfaceModule[I]`:
+
+- registers `ctor` with `name:"<scope>"` returning `I`
+- forces materialization via an internal `Invoke`, so lifecycle hooks wired
+  inside `ctor` always run even if no other consumer references the named
+  instance
+- on the **first** call across the process, also exposes the same instance
+  as the unnamed default of `I` (via `Alias`), so existing callers that
+  inject `I` without a `name` tag keep working unchanged
+
+Subsequent connectors of the same interface only contribute their named
+instance — there is no duplicate-provider conflict.
+
+### Consuming multiple implementations
+
+The application composition root still loads each connector by scope:
+
+```go
+fx.New(
+    sqlite_connector.Module("cache"),
+    postgres_connector.Module("main"),
+    fx.Invoke(func(p struct {
+        fx.In
+        Cache database.DatabaseConnector `name:"cache"`
+        Main  database.DatabaseConnector `name:"main"`
+    }) {
+        // use p.Cache and p.Main
+    }),
+)
+```
+
+If load order is brittle, always inject by named tag.
+
+### Test caveat: `ResetClaim`
+
+The "first call wins" claim on the unnamed default uses process-level state.
+Tests that build more than one `fx.App` in the same process must reset that
+claim between apps, otherwise later apps cannot register an unnamed default:
+
+```go
+import "github.com/weedbox/weedbox/fxmodule"
+
+func TestSomething(t *testing.T) {
+    fxmodule.ResetClaim[database.DatabaseConnector]()
+    t.Cleanup(func() { fxmodule.ResetClaim[database.DatabaseConnector]() })
+    // ... build fx.App ...
+}
+```
+
+### Lower-level primitives
+
+`InterfaceModule` is composed from smaller helpers, also exported for
+custom wiring:
+
+- `Provide(scope, ctor)` / `Invoke(scope, fn)` — like `fx.Provide` /
+  `fx.Invoke`, but optionally annotated with `name:"<scope>"` when `scope`
+  is non-empty
+- `Alias[T](name)` — expose a `name:"<name>"`-tagged instance of `T` as the
+  unnamed default
+- `ClaimDefault[T]()` / `ResetClaim[T]()` — atomically claim the unnamed
+  default slot for type `T` (first call wins) and reset it for tests
+
+For a deeper walkthrough see [`fxmodule/README.md`](fxmodule/README.md).
+
+## Complete Examples
+
+The `examples/` directory contains two runnable applications:
+
+### `examples/basic/`
+
+The canonical app skeleton — cobra CLI, configs, logger, daemon, plus the
+two module-authoring styles:
+
+- `main.go`: application entry point and CLI setup
+- `modules.go`: module loading and organization
+- `pkg/example/`: module written with native FX
+- `pkg/basic/`: module written with the Weedbox base class
 
 ```bash
 cd examples/basic
 go run . --verbose
 ```
+
+### `examples/connector/`
+
+Demonstrates the `fxmodule.InterfaceModule` pattern — one `Greeter`
+interface with two implementations loaded side-by-side, plus a consumer
+that injects them by name *and* via the unnamed default:
+
+- `pkg/greeter/`: interface definition
+- `pkg/english/`, `pkg/french/`: two connector-style modules using
+  `fxmodule.InterfaceModule`
+- `pkg/consumer/`: consumer wiring all three injections
+
+```bash
+cd examples/connector
+go run . --verbose
+```
+
+Swap the order of `english.Module` / `french.Module` in `modules.go` to
+see how load order controls which implementation wins the unnamed default
+slot.
 
 ## Core Interfaces
 

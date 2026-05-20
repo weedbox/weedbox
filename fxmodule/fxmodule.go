@@ -70,6 +70,39 @@ func ResetClaim[T any]() {
 	claimedDefaults.Delete(typeKey[T]())
 }
 
+// InterfaceModule registers ctor as a named implementation of interface I
+// keyed by scope, suitable for "one interface, multiple swappable
+// implementations" scenarios (database connectors, cache backends, message
+// brokers, etc.).
+//
+// Behavior:
+//   - ctor is registered with `name:"<scope>"` and must return I.
+//   - The result is forced to materialize via an Invoke, so lifecycle hooks
+//     wired inside ctor run even if no other consumer references the named
+//     instance.
+//   - The first call to InterfaceModule[I] across the process also exposes
+//     itself as the unnamed default of I (via Alias), so existing single-load
+//     consumers that inject I without a tag keep working with zero changes.
+//
+// Use this from a concrete module's Module(scope) factory. The application
+// composition root continues to write `<pkg>.Module("<scope>")` exactly as
+// before — InterfaceModule is connector-author scaffolding, not a
+// coordinator the application needs to wire.
+//
+// Tests that build multiple fx.Apps in the same process must call
+// ResetClaim[I] between apps; see the package-level doc for the single-
+// process state caveat.
+func InterfaceModule[I any](scope string, ctor any) fx.Option {
+	opts := []fx.Option{
+		Provide(scope, ctor),
+		Invoke(scope, func(I) {}),
+	}
+	if ClaimDefault[I]() {
+		opts = append(opts, Alias[I](scope))
+	}
+	return fx.Module(scope, opts...)
+}
+
 func typeKey[T any]() string {
 	return reflect.TypeFor[T]().String()
 }
